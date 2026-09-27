@@ -85,25 +85,83 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 // has no PAC prologue, and this helper is compiled with branch protection off, so it is safe to
 // call as the first thing in main(). Keys reset on execve, so every exec'd mldr re-applies this;
 // threads inherit the setting.
+//
+// Without the variable, the keys are also disabled automatically for an arm64e executable (the
+// slice mldr will load is CPU_SUBTYPE_ARM64E): until Darling's libraries are built as arm64e
+// themselves, such a process cannot work with PAC on, since every callback it hands to Darling
+// (bsearch/qsort comparators, atexit, pthread_create, blocks) arrives signed and is called with
+// a plain blr. DARLING_DISABLE_PTRAUTH=0 keeps the keys on anyway, for arm64e library work.
+
+// Subtype of the slice load()/load_fat() would pick for a Mach-O at path: for a fat file that is
+// the last CPU_TYPE_ARM64 slice, mirroring load_fat()'s default selection. -1 if unknown.
 __attribute__((target("branch-protection=none")))
-static void maybe_disable_ptrauth(char** envp)
+static int ptrauth_exe_subtype(const char* path)
 {
-	int enabled = 0;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	int subtype = -1;
+	uint32_t magic;
+	if (pread(fd, &magic, sizeof(magic), 0) == sizeof(magic))
+	{
+		if (magic == MH_MAGIC_64)
+		{
+			struct mach_header_64 mh;
+			if (pread(fd, &mh, sizeof(mh), 0) == sizeof(mh) && mh.cputype == CPU_TYPE_ARM64)
+				subtype = mh.cpusubtype & ~CPU_SUBTYPE_MASK;
+		}
+		else if (magic == FAT_CIGAM || magic == FAT_MAGIC)
+		{
+			const bool swap = magic == FAT_CIGAM;
+			struct fat_header fh;
+			if (pread(fd, &fh, sizeof(fh), 0) == sizeof(fh))
+			{
+				uint32_t n = swap ? __builtin_bswap32(fh.nfat_arch) : fh.nfat_arch;
+				for (uint32_t i = 0; i < n && i < 64; ++i)
+				{
+					struct fat_arch fa;
+					if (pread(fd, &fa, sizeof(fa), sizeof(fh) + i * sizeof(fa)) != sizeof(fa))
+						break;
+					uint32_t type = swap ? __builtin_bswap32(fa.cputype) : fa.cputype;
+					uint32_t sub = swap ? __builtin_bswap32(fa.cpusubtype) : fa.cpusubtype;
+					if (type == CPU_TYPE_ARM64)
+						subtype = sub & ~CPU_SUBTYPE_MASK;
+				}
+			}
+		}
+	}
+	close(fd);
+	return subtype;
+}
+
+__attribute__((target("branch-protection=none")))
+static void maybe_disable_ptrauth(int argc, char** argv, char** envp)
+{
+	int mode = -1; // -1: automatic, 0: forced on, 1: forced off
 	for (size_t i = 0; envp && envp[i] != NULL; ++i)
 	{
 		if (strcmp(envp[i], "DARLING_DISABLE_PTRAUTH=1") == 0)
-		{
-			enabled = 1;
-			break;
-		}
+			mode = 1;
+		else if (strcmp(envp[i], "DARLING_DISABLE_PTRAUTH=0") == 0)
+			mode = 0;
 	}
-	if (!enabled)
-		return;
 
-	// Ignore it in a process that gained privileges at exec (setuid, setgid or file capabilities):
-	// its caller controls the environment.
-	if (getauxval(AT_SECURE))
+	// Ignore the variable in a process that gained privileges at exec (setuid, setgid or file
+	// capabilities): its caller controls the environment. The automatic check depends only on
+	// the executable, so it still applies.
+	if (mode != -1 && getauxval(AT_SECURE))
+		mode = -1;
+	if (mode == 0)
 		return;
+	if (mode == -1)
+	{
+		// Same executable path main() uses: after '!' in argv[0] when exec'd by sys_execve(),
+		// otherwise argv[1].
+		const char* bang = argc > 0 ? strchr(argv[0], '!') : NULL;
+		const char* path = bang ? bang + 1 : (argc > 1 ? argv[1] : NULL);
+		if (!path || ptrauth_exe_subtype(path) != CPU_SUBTYPE_ARM64E)
+			return;
+	}
 
 	// enabled_keys = 0 -> all four keys disabled for this process and its future threads.
 	prctl(PR_PAC_SET_ENABLED_KEYS,
@@ -111,7 +169,7 @@ static void maybe_disable_ptrauth(char** envp)
 	      0, 0, 0);
 }
 #else
-static void maybe_disable_ptrauth(char** envp) { (void) envp; }
+static void maybe_disable_ptrauth(int argc, char** argv, char** envp) { (void) argc; (void) argv; (void) envp; }
 #endif
 
 static const char* dyld_path = INSTALL_PREFIX "/libexec/darling/usr/lib/dyld";
@@ -195,7 +253,7 @@ int main(int argc, char** argv, char** envp)
 {
 	// Must be first: turn off pointer authentication before any function that would
 	// authenticate a return address runs, if the container opted in. See the helper.
-	maybe_disable_ptrauth(envp);
+	maybe_disable_ptrauth(argc, argv, envp);
 
 	mdbg("mldr main() start");
 	void** sp;
