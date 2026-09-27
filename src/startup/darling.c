@@ -1808,6 +1808,21 @@ int main(int argc, char ** argv)
 			}
 		}
 
+		// Nonroot containers share the host PID namespace, so guests whose server died are
+		// reparented away from it and the ancestry walk above misses them. Collect them by this
+		// prefix's exact socket path in their environment.
+		if (g_nonroot)
+		{
+			useOriginalIds();
+			bool orphansStopped = shutdownOrphans(prefix, g_originalUid);
+			restoreRootIds();
+			if (!orphansStopped)
+			{
+				fprintf(stderr, "Could not stop leftover processes of this prefix.\n");
+				return 1;
+			}
+		}
+
 		char socketPath[4096];
 		snprintf(socketPath, sizeof(socketPath), "%s" SHELLSPAWN_SOCKPATH, prefix);
 

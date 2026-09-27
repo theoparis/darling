@@ -55,6 +55,74 @@ static int shutdownHandle(pid_t pid)
  return syscall(SYS_pidfd_open, pid, 0);
 }
 
+/* True if pid is an mldr process owned by uid whose initial environment names exactly this
+ * prefix's darlingserver socket. Every guest inherits __mldr_sockpath from the launcher or
+ * darlingserver, so this identifies a nonroot container's processes even after its server died
+ * (they are then reparented away from it and ancestry no longer finds them). */
+static bool shutdownOrphanMember(pid_t pid, uid_t uid, const char *expected)
+{
+ char path[64], buf[65536];
+ struct stat st;
+ snprintf(path, sizeof(path), "/proc/%d", pid);
+ if (stat(path, &st) || st.st_uid != uid) return false;
+ snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+ int fd = open(path, O_RDONLY | O_CLOEXEC);
+ if (fd < 0) return false;
+ ssize_t n = read(fd, buf, 64); close(fd);
+ if (n <= 0 || strncmp(buf, "mldr\n", 5)) return false;
+ snprintf(path, sizeof(path), "/proc/%d/environ", pid);
+ fd = open(path, O_RDONLY | O_CLOEXEC);
+ if (fd < 0) return false;
+ n = read(fd, buf, sizeof(buf)); close(fd);
+ for (ssize_t pos = 0; pos < n;) {
+  size_t len = strnlen(buf + pos, n - pos);
+  if ((ssize_t)len == n - pos) break;
+  if (!strcmp(buf + pos, expected)) return true;
+  pos += len + 1;
+ }
+ return false;
+}
+
+/* Terminate leftover guests of a nonroot prefix: TERM, wait up to 1s, then KILL. Handles are
+ * pinned and membership rechecked before signalling, so a recycled PID is never targeted. */
+static bool shutdownOrphans(const char *prefixPath, uid_t uid)
+{
+ char expected[4200];
+ if (snprintf(expected, sizeof(expected), "__mldr_sockpath=%s/.darlingserver.sock", prefixPath) >= (int)sizeof(expected))
+  return false;
+ DIR *dir = opendir("/proc");
+ if (!dir) return false;
+ struct pollfd *handles = NULL; size_t count = 0; bool ok = true;
+ struct dirent *entry;
+ while ((entry = readdir(dir))) {
+  pid_t pid = atoi(entry->d_name);
+  if (pid <= 1 || pid == getpid() || !shutdownOrphanMember(pid, uid, expected)) continue;
+  int fd = shutdownHandle(pid);
+  if (fd < 0) continue;
+  if (!shutdownOrphanMember(pid, uid, expected)) { close(fd); continue; }
+  struct pollfd *next = realloc(handles, (count + 1) * sizeof(*handles));
+  if (!next) { close(fd); ok = false; break; }
+  handles = next; handles[count++] = (struct pollfd){ .fd = fd, .events = POLLIN };
+ }
+ closedir(dir);
+ for (size_t i = 0; i < count; ++i)
+  syscall(SYS_pidfd_send_signal, handles[i].fd, SIGTERM, NULL, 0);
+ for (int attempt = 0; attempt < 20; ++attempt) {
+  size_t alive = 0;
+  for (size_t i = 0; i < count; ++i) { poll(&handles[i], 1, 0); if (!(handles[i].revents & POLLIN)) ++alive; }
+  if (!alive) break;
+  usleep(50000);
+ }
+ for (size_t i = 0; i < count; ++i)
+  if (syscall(SYS_pidfd_send_signal, handles[i].fd, SIGKILL, NULL, 0) < 0 && errno != ESRCH) ok = false;
+ for (size_t i = 0; i < count; ++i) {
+  if (poll(&handles[i], 1, 1000) <= 0) ok = false;
+  close(handles[i].fd);
+ }
+ free(handles);
+ return ok;
+}
+
 /* Called with a pinned, prefix-validated server. Snapshot handles before TERM so
  * descendants that become orphaned are still covered by the subsequent KILL.
  * Root containers also include reparented tasks in their private PID namespace.
